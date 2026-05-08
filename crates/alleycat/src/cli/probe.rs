@@ -72,7 +72,7 @@ pub async fn run(args: ProbeArgs) -> anyhow::Result<()> {
         None => server_secret.public(),
     };
 
-    let payload = host::pair_payload(&server_secret, &cfg);
+    let payload = host::pair_payload(&server_secret, &cfg, None);
     eprintln!(
         "probe: dialing node_id={} token={} relay={}",
         node_id,

@@ -21,7 +21,7 @@ pub async fn run(args: PairArgs) -> anyhow::Result<()> {
     } else {
         let cfg = crate::config::load_or_init().await?;
         let secret_key = crate::state::load_or_create_secret_key().await?;
-        host::pair_payload(&secret_key, &cfg)
+        host::pair_payload(&secret_key, &cfg, None)
     };
 
     let json = serde_json::to_string(&payload)?;

@@ -93,6 +93,7 @@ pub async fn run() -> anyhow::Result<()> {
         config: Arc::clone(&config),
         agents,
         secret_key,
+        endpoint: endpoint.clone(),
         node_id,
         started_at,
         shutdown: Arc::clone(&shutdown),
@@ -123,6 +124,7 @@ struct DaemonState {
     config: Arc<ArcSwap<HostConfig>>,
     agents: AgentManager,
     secret_key: iroh::SecretKey,
+    endpoint: iroh::Endpoint,
     node_id: String,
     started_at: Instant,
     shutdown: Arc<Notify>,
@@ -199,7 +201,7 @@ async fn handle_status(daemon: &DaemonState) -> Response {
 
 fn handle_pair(daemon: &DaemonState) -> Response {
     let cfg = daemon.config.load();
-    let payload = host::pair_payload(&daemon.secret_key, &cfg);
+    let payload = host::pair_payload(&daemon.secret_key, &cfg, Some(&daemon.endpoint));
     Response::ok_with(&payload).unwrap_or_else(|e| Response::err(e.to_string()))
 }
 
@@ -209,7 +211,7 @@ async fn handle_rotate(daemon: &DaemonState) -> Response {
         Err(error) => return Response::err(format!("rotate failed: {error:#}")),
     };
     let token_short = token_fingerprint(&new_cfg.token);
-    let payload = host::pair_payload(&daemon.secret_key, &new_cfg);
+    let payload = host::pair_payload(&daemon.secret_key, &new_cfg, Some(&daemon.endpoint));
     daemon.config.store(Arc::new(new_cfg));
     Response::ok_with(&RotateResult {
         token_short,

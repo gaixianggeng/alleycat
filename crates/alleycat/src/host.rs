@@ -219,14 +219,26 @@ async fn handle_stream(
 pub fn pair_payload(
     secret_key: &iroh::SecretKey,
     config: &HostConfig,
+    endpoint: Option<&Endpoint>,
 ) -> crate::protocol::PairPayload {
     crate::protocol::PairPayload {
         v: PROTOCOL_VERSION,
         node_id: secret_key.public().to_string(),
         token: config.token.clone(),
         host_name: local_host_name(),
-        relay: config.relay.clone(),
+        relay: endpoint_home_relay(endpoint).or_else(|| config.relay.clone()),
     }
+}
+
+/// Read the iroh endpoint's currently-known home relay, if any. Pair payloads
+/// prefer this over the static config so phones can dial the host even when
+/// pkarr/DNS publishing is broken (e.g. IPv6-only relays + Tailscale).
+fn endpoint_home_relay(endpoint: Option<&Endpoint>) -> Option<String> {
+    endpoint?
+        .addr()
+        .relay_urls()
+        .next()
+        .map(|url| url.to_string())
 }
 
 fn local_host_name() -> Option<String> {
@@ -272,7 +284,7 @@ mod tests {
             session: crate::config::SessionConfig::default(),
         };
 
-        let payload = pair_payload(&secret_key, &config);
+        let payload = pair_payload(&secret_key, &config, None);
 
         assert_eq!(payload.v, PROTOCOL_VERSION);
         assert_eq!(payload.node_id, secret_key.public().to_string());
