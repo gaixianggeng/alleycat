@@ -17,6 +17,7 @@ pub enum Prereq {
     Opencode { bin: PathBuf },
     Droid { bin: PathBuf },
     Hermes { bin: PathBuf },
+    Acp { bin: PathBuf },
 }
 
 #[derive(Debug)]
@@ -41,6 +42,7 @@ pub async fn check(target: TargetId) -> Result<Prereq, SkipReason> {
         TargetId::Opencode => check_opencode(),
         TargetId::Droid => check_droid(),
         TargetId::Hermes => check_hermes(),
+        TargetId::Acp => check_acp(),
     }
 }
 
@@ -98,6 +100,13 @@ fn check_hermes() -> Result<Prereq, SkipReason> {
     let bin = which_or_env("HERMES_BRIDGE_BIN", "hermes")
         .ok_or_else(|| SkipReason::Reason("hermes not on PATH; set HERMES_BRIDGE_BIN".into()))?;
     Ok(Prereq::Hermes { bin })
+}
+
+fn check_acp() -> Result<Prereq, SkipReason> {
+    let bin = which_or_env("ACP_BRIDGE_AGENT_BIN", "devin").ok_or_else(|| {
+        SkipReason::Reason("ACP agent (e.g., devin) not on PATH; set ACP_BRIDGE_AGENT_BIN".into())
+    })?;
+    Ok(Prereq::Acp { bin })
 }
 
 fn which_or_env(env_var: &str, bin_name: &str) -> Option<PathBuf> {

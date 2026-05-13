@@ -88,7 +88,6 @@ pub struct AgentCapabilities {
     pub uses_direct_codex_port: bool,
 }
 
-
 /// Resume hint sent on `Connect` when a reconnecting client wants to
 /// reattach to an existing session for `(client_node_id, agent)`. The server
 /// keys on the iroh `remote_node_id`, so the client doesn't need to (and

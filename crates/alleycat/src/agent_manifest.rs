@@ -149,6 +149,20 @@ pub const MANIFESTS: &[AgentManifest] = &[
         supports_ssh_bridge: false,
         uses_direct_codex_port: false,
     },
+    AgentManifest {
+        name: "devin",
+        display_name: "Devin",
+        wire: AgentWire::Jsonl,
+        title: Some("Devin"),
+        is_beta: true,
+        sort_order: 7,
+        description: Some("Devin coding agent."),
+        aliases: &[],
+        locks_reasoning_effort_after_activity: false,
+        visible_modes: None,
+        supports_ssh_bridge: true,
+        uses_direct_codex_port: false,
+    },
 ];
 
 pub fn manifest_for(name: &str) -> Option<&'static AgentManifest> {

@@ -63,6 +63,7 @@ pub struct AgentsConfig {
     pub claude: ClaudeAgentConfig,
     pub droid: DroidAgentConfig,
     pub hermes: HermesAgentConfig,
+    pub devin: DevinAgentConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -203,6 +204,22 @@ impl Default for HermesAgentConfig {
             enabled: true,
             bin: "hermes".to_string(),
             api_base: "http://127.0.0.1:8642".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct DevinAgentConfig {
+    pub enabled: bool,
+    pub bin: String,
+}
+
+impl Default for DevinAgentConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            bin: "devin".to_string(),
         }
     }
 }

@@ -4,10 +4,12 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use alleycat_acp_bridge::AcpBridge;
 use alleycat_amp_bridge::AmpBridge;
 use alleycat_bridge_core::session::{Session, SessionRegistry, SessionRegistryConfig};
 use alleycat_bridge_core::{Bridge, LocalLauncher};
 use alleycat_claude_bridge::ClaudeBridge;
+use alleycat_devin_bridge::DevinBridge;
 use alleycat_droid_bridge::DroidBridge;
 use alleycat_hermes_bridge::{HermesBridge, HermesBridgeConfig};
 use alleycat_opencode_bridge::OpencodeBridge;
@@ -37,13 +39,17 @@ pub enum AgentKind {
     Opencode,
     Droid,
     Hermes,
+    Devin,
 }
 
-/// How the daemon talks to `codex app-server`. Selected at startup by
-/// probing `codex app-server --help` for `--listen` support, then cached
-/// for the daemon's lifetime.
+/// How the daemon talks to `codex app-server`. Selected at startup by probing
+/// the user-installed `codex` binary, then cached for the daemon's lifetime.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CodexMode {
+    /// `<bin> app-server --listen unix://` plus one `<bin> app-server proxy`
+    /// child per iroh stream. This matches Codex Desktop's remote transport
+    /// and keeps Codex state in the default app-server Unix socket.
+    UnixProxy,
     /// `<bin> app-server --listen ws://host:port` — one shared child for
     /// the daemon lifetime, multi-client over websocket. Works on
     /// codex-cli versions that grew the `--listen` flag (≥ early 2026).
@@ -68,14 +74,13 @@ pub struct AgentManager {
     /// child + opens an SSE subscription; we don't want to pay that cost on
     /// daemon startup if no client ever asks for opencode.
     opencode_bridge: Arc<OnceCell<Arc<OpencodeBridge>>>,
-    /// One shared `codex app-server --listen ws://...` for the daemon
-    /// lifetime, lazy-spawned on first `connect`. Codex multiplexes
-    /// conversations internally, so each iroh stream is its own websocket
-    /// client and the child stays up across client disconnects. Only
-    /// populated when [`AgentManager::codex_mode`] is `Websocket`.
+    /// One daemon-owned `codex app-server` child for modes that keep a shared
+    /// app-server alive (`UnixProxy` or legacy `Websocket`). Not populated when
+    /// Alleycat is proxying to an externally-started Codex app-server.
     codex_child: Arc<Mutex<Option<Child>>>,
     /// Detected once at startup. Determines whether `serve_codex` runs the
-    /// websocket byte-pump or per-stream stdio bridging.
+    /// Unix proxy byte-pump, legacy websocket byte-pump, or per-stream stdio
+    /// bridging.
     codex_mode: CodexMode,
     /// The resolved codex executable selected during startup probing.
     codex_bin: PathBuf,
@@ -146,11 +151,25 @@ impl AgentManager {
             .await
             .context("building droid bridge")?;
 
+        let devin_builder = AcpBridge::builder()
+            .agent_bin(snapshot.agents.devin.bin.clone())
+            .launcher(Arc::new(LocalLauncher));
+        let devin_acp = devin_builder
+            .build()
+            .await
+            .context("building devin bridge")?;
+        // Wrap the generic ACP bridge so `thread/list` reads devin's local
+        // SQLite store directly; ACP `session/list` filters out
+        // untitled/low-activity sessions and the mobile UI wants everything.
+        let devin_bridge: Arc<dyn Bridge> =
+            Arc::new(DevinBridge::with_default_db(devin_acp).context("wiring devin bridge")?);
+
         let mut bridges: HashMap<AgentKind, Arc<dyn Bridge>> = HashMap::new();
         bridges.insert(AgentKind::Pi, pi_bridge as Arc<dyn Bridge>);
         bridges.insert(AgentKind::Amp, amp_bridge as Arc<dyn Bridge>);
         bridges.insert(AgentKind::Claude, claude_bridge as Arc<dyn Bridge>);
         bridges.insert(AgentKind::Droid, droid_bridge as Arc<dyn Bridge>);
+        bridges.insert(AgentKind::Devin, devin_bridge);
 
         let hermes_cfg = &snapshot.agents.hermes;
         let hermes_bridge_cfg = HermesBridgeConfig {
@@ -213,6 +232,23 @@ impl AgentManager {
         &self.session_registry
     }
 
+    /// Fan out a shutdown call to every registered bridge. Called from
+    /// the daemon's graceful shutdown path so each bridge can kill its
+    /// child processes (ACP agents, claude, etc.) before the daemon
+    /// returns. Without this, the tokio runtime Drop chain is the only
+    /// thing keeping `kill_on_drop` honest — and that's not reliable
+    /// on process exit, which is how we ended up with multiple
+    /// `devin acp` zombies between restarts.
+    pub async fn shutdown(&self) {
+        for (kind, bridge) in &self.bridges {
+            info!(agent = agent_kind_str(*kind), "shutting down bridge");
+            bridge.shutdown().await;
+        }
+        if let Some(opencode) = self.opencode_bridge.get() {
+            opencode.shutdown().await;
+        }
+    }
+
     pub async fn list_agents(&self) -> Vec<AgentInfo> {
         // Availability is computed per-agent (some are async, some not),
         // then each manifest is rendered to the wire `AgentInfo` shape.
@@ -226,10 +262,12 @@ impl AgentManager {
                 "claude" => self.claude_available(),
                 "droid" => self.droid_available(),
                 "hermes" => self.hermes_available().await,
+                "devin" => self.devin_available(),
                 _ => false,
             };
             let wire = if manifest.name == "codex" {
                 match self.codex_mode {
+                    CodexMode::UnixProxy => AgentWire::Websocket,
                     CodexMode::Websocket => AgentWire::Websocket,
                     CodexMode::Stdio => AgentWire::Jsonl,
                 }
@@ -325,6 +363,7 @@ impl AgentManager {
             "claude" => Some("claude"),
             "droid" => Some("droid"),
             "hermes" => Some("hermes"),
+            "devin" => Some("devin"),
             _ => None,
         }
     }
@@ -339,6 +378,7 @@ impl AgentManager {
             "claude" => cfg.agents.claude.enabled,
             "droid" => cfg.agents.droid.enabled,
             "hermes" => cfg.agents.hermes.enabled,
+            "devin" => cfg.agents.devin.enabled,
             _ => false,
         }
     }
@@ -362,6 +402,12 @@ impl AgentManager {
             return Ok(());
         }
 
+        if self.codex_mode == CodexMode::UnixProxy {
+            return Err(anyhow!(
+                "codex app-server Unix socket is not owned by this daemon"
+            ));
+        }
+
         let (host, port) = {
             let cfg = self.config.load();
             (cfg.agents.codex.host.clone(), cfg.agents.codex.port)
@@ -376,9 +422,39 @@ impl AgentManager {
 
     async fn serve_codex(&self, iroh_stream: IrohStream) -> anyhow::Result<()> {
         match self.codex_mode {
+            CodexMode::UnixProxy => self.serve_codex_unix_proxy(iroh_stream).await,
             CodexMode::Websocket => self.serve_codex_ws(iroh_stream).await,
             CodexMode::Stdio => self.serve_codex_stdio(iroh_stream).await,
         }
+    }
+
+    async fn serve_codex_unix_proxy(&self, mut iroh_stream: IrohStream) -> anyhow::Result<()> {
+        let bin = self.ensure_codex_unix_running().await?;
+        let mut child = Command::new(&bin)
+            .arg("app-server")
+            .arg("proxy")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .with_context(|| format!("spawning `{} app-server proxy`", bin.display()))?;
+
+        let stdin = child.stdin.take().expect("piped stdin");
+        let stdout = child.stdout.take().expect("piped stdout");
+        let stderr = child.stderr.take().expect("piped stderr");
+
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                warn!(target: "codex", "{line}");
+            }
+        });
+
+        let mut child_io = tokio::io::join(stdout, stdin);
+        let _ = tokio::io::copy_bidirectional(&mut iroh_stream, &mut child_io).await;
+        let _ = child.wait().await;
+        Ok(())
     }
 
     async fn serve_codex_ws(&self, mut iroh_stream: IrohStream) -> anyhow::Result<()> {
@@ -388,6 +464,69 @@ impl AgentManager {
             .with_context(|| format!("connecting to codex app-server at {host}:{port}"))?;
         let _ = tokio::io::copy_bidirectional(&mut iroh_stream, &mut tcp).await;
         Ok(())
+    }
+
+    /// Ensures Codex's default Unix-socket app-server is reachable. If an
+    /// external Codex daemon/Desktop already owns the socket, Alleycat leaves it
+    /// alone and only starts per-stream `app-server proxy` children.
+    async fn ensure_codex_unix_running(&self) -> anyhow::Result<PathBuf> {
+        let bin = {
+            let cfg = self.config.load();
+            if !cfg.agents.codex.enabled {
+                return Err(anyhow!("codex agent is disabled"));
+            }
+            self.codex_bin.clone()
+        };
+
+        if probe_codex_app_server_proxy(&bin).await.is_ok() {
+            return Ok(bin);
+        }
+
+        let mut guard = self.codex_child.lock().await;
+        if probe_codex_app_server_proxy(&bin).await.is_ok() {
+            return Ok(bin);
+        }
+
+        let child_alive = matches!(guard.as_mut().map(Child::try_wait), Some(Ok(None)));
+        if !child_alive {
+            let mut child = Command::new(&bin)
+                .arg("app-server")
+                .arg("--listen")
+                .arg("unix://")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .with_context(|| {
+                    format!("spawning `{} app-server --listen unix://`", bin.display())
+                })?;
+
+            if let Some(stderr) = child.stderr.take() {
+                tokio::spawn(async move {
+                    let mut lines = BufReader::new(stderr).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        warn!(target: "codex", "{line}");
+                    }
+                });
+            }
+
+            *guard = Some(child);
+        }
+        drop(guard);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if probe_codex_app_server_proxy(&bin).await.is_ok() {
+                return Ok(bin);
+            }
+            if Instant::now() >= deadline {
+                return Err(anyhow!(
+                    "codex app-server did not become reachable through app-server proxy within 5s"
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
 
     /// Per-stream stdio bridge for codex versions that don't support
@@ -569,6 +708,11 @@ impl AgentManager {
             && has_factory_auth(&cfg.agents.droid.api_key_env)
     }
 
+    fn devin_available(&self) -> bool {
+        let cfg = self.config.load();
+        cfg.agents.devin.enabled && which::which(&cfg.agents.devin.bin).is_ok()
+    }
+
     async fn hermes_available(&self) -> bool {
         let (enabled, bin, api_base) = {
             let cfg = self.config.load();
@@ -590,12 +734,12 @@ async fn hermes_api_available(api_base: &str) -> bool {
     )
 }
 
-/// Probe `<bin> app-server --help` and check whether the `--listen` flag
-/// is documented. If yes, the daemon can run a single shared websocket
-/// app-server; if no (older codex), we fall back to per-stream stdio. On
-/// any failure (binary missing, exec error, garbled output) makes that
-/// candidate unavailable. If no candidate can be spawned, we keep `Stdio` as
-/// the fallback mode but report codex unavailable.
+/// Probe the user-installed Codex CLI. Prefer the Unix app-server proxy when
+/// available, because it matches Codex Desktop's remote transport. Fall back to
+/// the older TCP websocket listener or finally stdio for older CLIs. Any
+/// failure (binary missing, exec error, garbled output) makes that candidate
+/// unavailable. If no candidate can be spawned, we keep `Stdio` as the fallback
+/// mode but report codex unavailable.
 async fn detect_codex(bin: &str) -> CodexDetection {
     let fallback_bin = PathBuf::from(bin);
     let candidates = {
@@ -647,7 +791,11 @@ async fn detect_codex(bin: &str) -> CodexDetection {
         }
         let mut help = String::from_utf8_lossy(&output.stdout).into_owned();
         help.push_str(&String::from_utf8_lossy(&output.stderr));
-        let mode = if help.contains("--listen") {
+        let listen_supported = help.contains("--listen");
+        let proxy_supported = codex_app_server_proxy_supported(&candidate).await;
+        let mode = if listen_supported && proxy_supported {
+            CodexMode::UnixProxy
+        } else if listen_supported {
             CodexMode::Websocket
         } else {
             CodexMode::Stdio
@@ -664,6 +812,69 @@ async fn detect_codex(bin: &str) -> CodexDetection {
         bin: fallback_bin,
         available: false,
     }
+}
+
+async fn codex_app_server_proxy_supported(bin: &Path) -> bool {
+    matches!(
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            Command::new(bin)
+                .arg("app-server")
+                .arg("proxy")
+                .arg("--help")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status(),
+        )
+        .await,
+        Ok(Ok(status)) if status.success()
+    )
+}
+
+async fn probe_codex_app_server_proxy(bin: &Path) -> anyhow::Result<()> {
+    let mut child = Command::new(bin)
+        .arg("app-server")
+        .arg("proxy")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .with_context(|| format!("spawning `{} app-server proxy`", bin.display()))?;
+
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow!("app-server proxy child missing stdin"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("app-server proxy child missing stdout"))?;
+    let stderr = child.stderr.take();
+
+    if let Some(stderr) = stderr {
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                warn!(target: "codex", "{line}");
+            }
+        });
+    }
+
+    let child_io = tokio::io::join(stdout, stdin);
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        tokio_tungstenite::client_async("ws://codex-app-server-proxy.localhost/", child_io),
+    )
+    .await
+    .context("timed out opening websocket over codex app-server proxy")?;
+
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+
+    result
+        .map(|_| ())
+        .context("codex app-server proxy websocket handshake failed")
 }
 
 fn program_candidates(program: &Path) -> Vec<PathBuf> {
@@ -722,6 +933,7 @@ fn agent_kind_from_str(name: &str) -> Option<AgentKind> {
         "opencode" => Some(AgentKind::Opencode),
         "droid" => Some(AgentKind::Droid),
         "hermes" => Some(AgentKind::Hermes),
+        "devin" => Some(AgentKind::Devin),
         _ => None,
     }
 }
@@ -734,6 +946,7 @@ fn agent_kind_str(kind: AgentKind) -> &'static str {
         AgentKind::Opencode => "opencode",
         AgentKind::Droid => "droid",
         AgentKind::Hermes => "hermes",
+        AgentKind::Devin => "devin",
     }
 }
 
@@ -746,6 +959,7 @@ impl crate::config::AgentsConfig {
             AgentKind::Opencode => self.opencode.enabled,
             AgentKind::Droid => self.droid.enabled,
             AgentKind::Hermes => self.hermes.enabled,
+            AgentKind::Devin => self.devin.enabled,
         }
     }
 }

@@ -116,6 +116,13 @@ pub async fn run() -> anyhow::Result<()> {
         }
     }
 
+    // Kill agent child processes (ACP, claude, …) deterministically.
+    // Without this, only tokio's `kill_on_drop` keeps them honest, and
+    // that's racy on process exit — between restarts we'd accumulate
+    // orphaned `devin acp` children until manual `pkill`.
+    info!("shutting down bridges");
+    daemon.agents.shutdown().await;
+
     info!("daemon exited cleanly");
     Ok(())
 }

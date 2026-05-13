@@ -98,6 +98,14 @@ pub trait Bridge: Send + Sync + 'static {
     ) -> Result<Value, JsonRpcError>;
 
     async fn notification(&self, _ctx: &Conn, _method: &str, _params: Value) {}
+
+    /// Called once during daemon graceful shutdown. Bridges that spawn
+    /// long-lived child processes (ACP agents, claude, opencode, …)
+    /// should override this to kill their children synchronously rather
+    /// than relying on the tokio runtime's Drop chain — Drop may not
+    /// run all the way through during process exit, which leaves
+    /// orphaned children behind across restarts.
+    async fn shutdown(&self) {}
 }
 
 #[derive(Debug, Clone)]

@@ -416,6 +416,28 @@ impl KnownDivergence {
                 ),
                 field_path_divergences: COMMON_FIELD_DIVERGENCES,
             },
+            TargetId::Acp => Self {
+                target,
+                // ACP: methods that return METHOD_NOT_FOUND (not supported by ACP protocol)
+                skipped_methods: concat_static(
+                    &[
+                        "thread/rollback",
+                        "thread/archive",
+                        "thread/unarchive",
+                        "review/start",
+                        "command/exec/write",
+                        "command/exec/resize",
+                    ],
+                    SHAPE_DIVERGENT_RESPONSES,
+                ),
+                skipped_notifications: concat_static(
+                    &[
+                        // thread/name/updated is now implemented
+                    ],
+                    SHAPE_DIVERGENT_NOTIFICATIONS,
+                ),
+                field_path_divergences: COMMON_FIELD_DIVERGENCES,
+            },
         }
     }
 }
