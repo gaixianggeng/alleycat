@@ -33,9 +33,9 @@
 
 use std::collections::HashMap;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
-use crate::translator::{render_tool_call_public, ToolCallStatePublic};
+use crate::translator::{ToolCallStatePublic, render_tool_call_public};
 
 /// Notification sink: receives `(method, params)` pairs as the emitter
 /// fires them. Production code passes a closure that hands the payload
@@ -128,7 +128,9 @@ impl TurnStreamEmitter {
             .and_then(|v| v.as_str())
             .unwrap_or("");
         match kind {
-            "agent_message_chunk" => self.handle_text(TextKind::AgentMessage, update.get("content")),
+            "agent_message_chunk" => {
+                self.handle_text(TextKind::AgentMessage, update.get("content"))
+            }
             "agent_thought_chunk" => self.handle_text(TextKind::Reasoning, update.get("content")),
             "user_message_chunk" => {
                 // Devin sometimes echoes the user prompt as a chunk; we

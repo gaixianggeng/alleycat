@@ -731,7 +731,11 @@ impl Bridge for AcpBridge {
                 } else {
                     decode(params)?
                 };
-                to_value(handlers::handle_model_list(self, &ctx.session().agent, typed))
+                to_value(handlers::handle_model_list(
+                    self,
+                    &ctx.session().agent,
+                    typed,
+                ))
             }
             "experimentalFeature/list" => to_value(handlers::handle_experimental_feature_list()),
             "collaborationMode/list" => to_value(handlers::handle_collaboration_mode_list(self)),

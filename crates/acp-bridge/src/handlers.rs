@@ -77,11 +77,11 @@ pub fn handle_model_list(
 ) -> p::ModelListResponse {
     let cached = bridge.all_models();
     if !cached.is_empty() {
-        let data: Vec<p::Model> = cached
-            .iter()
-            .map(|m| acp_model_to_codex(m))
-            .collect();
-        return p::ModelListResponse { data, next_cursor: None };
+        let data: Vec<p::Model> = cached.iter().map(|m| acp_model_to_codex(m)).collect();
+        return p::ModelListResponse {
+            data,
+            next_cursor: None,
+        };
     }
     // Fallback: agent hasn't yet started a session so we have no
     // catalog. Return a single placeholder so the iOS picker has at
