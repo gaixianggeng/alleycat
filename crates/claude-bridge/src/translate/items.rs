@@ -71,23 +71,27 @@ pub fn list_user_message_ids_from_text(text: &str) -> Vec<String> {
         if record.record_type != "user" {
             continue;
         }
+        if record.is_meta {
+            continue;
+        }
         let Some(uuid) = record.uuid.as_deref() else {
             continue;
         };
         let Some(message) = &record.message else {
             continue;
         };
+        let content = message.get("content").unwrap_or(&Value::Null);
+        if is_internal_local_command_content(content) {
+            continue;
+        }
         // Skip tool-result-only user records (these are claude's tool loop
         // feeding results back, not a fresh user turn).
-        let is_tool_result_only = message
-            .get("content")
-            .and_then(Value::as_array)
-            .is_some_and(|arr| {
-                !arr.is_empty()
-                    && arr
-                        .iter()
-                        .all(|b| b.get("type").and_then(Value::as_str) == Some("tool_result"))
-            });
+        let is_tool_result_only = content.as_array().is_some_and(|arr| {
+            !arr.is_empty()
+                && arr
+                    .iter()
+                    .all(|b| b.get("type").and_then(Value::as_str) == Some("tool_result"))
+        });
         if is_tool_result_only {
             continue;
         }
@@ -340,6 +344,29 @@ fn image_source_to_data_url(source: &Value) -> Option<String> {
     let media_type = source.get("media_type").and_then(Value::as_str)?;
     let data = source.get("data").and_then(Value::as_str)?;
     Some(format!("data:{media_type};base64,{data}"))
+}
+
+/// Claude Code 把 `/model` 等本地命令以顶层 `user` 记录写入 transcript，
+/// 但这些记录只服务 CLI 自身，不能在移动端伪装成用户发送的对话消息。
+/// 这里只识别完整的保留标签包装，避免误删普通文本中对标签的讨论。
+fn is_internal_local_command_content(content: &Value) -> bool {
+    let Some(text) = content.as_str() else {
+        return false;
+    };
+    let text = text.trim();
+    is_complete_reserved_tag(text, "local-command-caveat")
+        || is_complete_reserved_tag(text, "local-command-stdout")
+        || is_complete_reserved_tag(text, "local-command-stderr")
+        || (text.starts_with("<command-name>")
+            && text.contains("</command-name>")
+            && text.contains("<command-message>")
+            && text.contains("</command-message>")
+            && text.contains("<command-args>")
+            && text.ends_with("</command-args>"))
+}
+
+fn is_complete_reserved_tag(text: &str, tag: &str) -> bool {
+    text.starts_with(&format!("<{tag}>")) && text.ends_with(&format!("</{tag}>"))
 }
 
 /// If `content` is a single `tool_result` block (no human text), fold the
@@ -915,6 +942,9 @@ pub struct OnDiskRecord {
     pub timestamp: Option<String>,
     #[serde(default)]
     pub uuid: Option<String>,
+    /// Claude Code 标记的内部提示，例如 local-command caveat。
+    #[serde(default)]
+    pub is_meta: bool,
 }
 
 enum ClassifiedRecord {
@@ -940,10 +970,16 @@ impl OnDiskRecord {
             .unwrap_or(0);
         match self.record_type.as_str() {
             "user" => {
+                if self.is_meta {
+                    return ClassifiedRecord::Skip;
+                }
                 let Some(message) = &self.message else {
                     return ClassifiedRecord::Skip;
                 };
                 let content = message.get("content").cloned().unwrap_or(Value::Null);
+                if is_internal_local_command_content(&content) {
+                    return ClassifiedRecord::Skip;
+                }
                 ClassifiedRecord::User { ts, content }
             }
             "assistant" => {
@@ -1040,6 +1076,88 @@ mod tests {
             },
             other => panic!("expected UserMessage, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn local_command_records_do_not_anchor_turns() {
+        let records = vec![
+            record(json!({
+                "type": "user",
+                "isMeta": true,
+                "message": {
+                    "role": "user",
+                    "content": "<local-command-caveat>internal</local-command-caveat>"
+                },
+                "timestamp": "2026-07-17T05:11:52.109Z",
+                "uuid": "meta"
+            })),
+            record(json!({
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": "<command-name>/model</command-name>\n<command-message>model</command-message>\n<command-args>sonnet</command-args>"
+                },
+                "timestamp": "2026-07-17T05:11:52.109Z",
+                "uuid": "command"
+            })),
+            record(json!({
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": "<local-command-stdout>Set model to sonnet</local-command-stdout>"
+                },
+                "timestamp": "2026-07-17T05:11:52.109Z",
+                "uuid": "stdout"
+            })),
+            record(json!({
+                "type": "user",
+                "message": {"role": "user", "content": "真正的用户消息"},
+                "timestamp": "2026-07-17T05:11:52.573Z",
+                "uuid": "real"
+            })),
+        ];
+
+        let turns = records_to_turns(&records);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].items.len(), 1);
+        match &turns[0].items[0] {
+            ThreadItem::UserMessage { content, .. } => match &content[0] {
+                UserInput::Text { text, .. } => assert_eq!(text, "真正的用户消息"),
+                other => panic!("expected text, got {other:?}"),
+            },
+            other => panic!("expected UserMessage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rollback_user_ids_ignore_local_command_records() {
+        let text = [
+            json!({
+                "type": "user",
+                "isMeta": true,
+                "message": {"role": "user", "content": "metadata"},
+                "uuid": "meta"
+            }),
+            json!({
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": "<local-command-stdout>done</local-command-stdout>"
+                },
+                "uuid": "local"
+            }),
+            json!({
+                "type": "user",
+                "message": {"role": "user", "content": "real"},
+                "uuid": "real"
+            }),
+        ]
+        .iter()
+        .map(Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+        assert_eq!(list_user_message_ids_from_text(&text), vec!["real"]);
     }
 
     #[test]
