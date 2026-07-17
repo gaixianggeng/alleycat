@@ -41,13 +41,13 @@ use alleycat_codex_proto::{
     ItemStartedNotification, McpToolCallError, McpToolCallProgressNotification, McpToolCallResult,
     McpToolCallStatus, PatchApplyStatus, PatchChangeKind, ReasoningTextDeltaNotification,
     ServerNotification, ThreadItem, ThreadTokenUsage, ThreadTokenUsageUpdatedNotification,
-    TokenUsageBreakdown, ToolRequestUserInputOption, ToolRequestUserInputQuestion, TurnError,
-    TurnPlanStep, TurnPlanStepStatus, TurnPlanUpdatedNotification, TurnStatus, WarningNotification,
+    TokenUsageBreakdown, TurnError, TurnPlanStep, TurnPlanStepStatus, TurnPlanUpdatedNotification,
+    TurnStatus, WarningNotification,
 };
 
 use crate::pool::claude_protocol::{
-    ClaudeOutbound, ContentBlock, ContentBlockDelta, RateLimitEnvelope, RawAnthropicEvent,
-    ResultEnvelope, StreamEventEnvelope, SystemEvent, UserEnvelope,
+    AssistantEnvelope, ClaudeOutbound, ContentBlock, ContentBlockDelta, RateLimitEnvelope,
+    RawAnthropicEvent, ResultEnvelope, StreamEventEnvelope, SystemEvent, UserEnvelope,
 };
 use crate::translate::tool_call::{CodexToolKind, classify};
 
@@ -77,7 +77,8 @@ pub struct EventTranslatorState {
     /// `content_block.index → tool_use_id` so `input_json_delta` /
     /// `content_block_stop` events can find their matching open tool call
     /// without iterating the entire `open_tool_calls` table.
-    block_index_to_tool_id: HashMap<u32, String>,
+    // 子 Agent 的流会重复使用 content block index；必须连同 parent 一起索引。
+    block_index_to_tool_id: HashMap<(Option<String>, u32), String>,
     /// `tool_use_id → item_id` for every tool open in this turn. Used to
     /// resolve `parent_tool_use_id` on subagent events.
     subagent_parents: HashMap<String, String>,
@@ -101,23 +102,6 @@ pub struct EventTranslatorState {
     /// shape so emitted plans have a stable display order. Mirrors what
     /// upstream codex publishes via `turn/plan/updated`.
     todo_steps: Vec<(String, TurnPlanStep)>,
-
-    /// AskUserQuestion calls staged at content_block_stop, awaiting the
-    /// orchestration layer (handlers/turn.rs) to drain them, dispatch
-    /// `item/tool/requestUserInput`, and inject the synthesized
-    /// `tool_result` back into claude's stdin. Drained via
-    /// [`EventTranslatorState::take_pending_user_input_requests`].
-    pending_user_input_requests: Vec<PendingUserInputRequest>,
-}
-
-/// One AskUserQuestion call awaiting the codex client's answer. Carries
-/// everything the orchestrator needs to (a) ask the codex client and (b)
-/// build the synthetic `tool_result` claude expects on stdin.
-#[derive(Debug, Clone)]
-pub struct PendingUserInputRequest {
-    pub item_id: String,
-    pub tool_use_id: String,
-    pub questions: Vec<ToolRequestUserInputQuestion>,
 }
 
 #[derive(Debug, Clone)]
@@ -176,15 +160,7 @@ impl EventTranslatorState {
             cumulative_token_usage: TokenUsageBreakdown::default(),
             model_context_window: None,
             todo_steps: Vec::new(),
-            pending_user_input_requests: Vec::new(),
         }
-    }
-
-    /// Drain pending AskUserQuestion requests so the turn handler can
-    /// dispatch them. Each call returns and clears whatever has been
-    /// staged since the last drain.
-    pub fn take_pending_user_input_requests(&mut self) -> Vec<PendingUserInputRequest> {
-        std::mem::take(&mut self.pending_user_input_requests)
     }
 
     pub fn thread_id(&self) -> &str {
@@ -225,7 +201,7 @@ impl EventTranslatorState {
             ClaudeOutbound::System(SystemEvent::Status(_)) => Vec::new(),
             ClaudeOutbound::System(SystemEvent::Other) => Vec::new(),
             ClaudeOutbound::StreamEvent(env) => self.translate_stream_event(env),
-            ClaudeOutbound::Assistant(_) => Vec::new(),
+            ClaudeOutbound::Assistant(env) => self.translate_assistant_envelope(env),
             ClaudeOutbound::User(env) => self.translate_user_envelope(env),
             ClaudeOutbound::RateLimitEvent(env) => self.translate_rate_limit(env),
             ClaudeOutbound::Result(r) => self.translate_result(r),
@@ -263,6 +239,69 @@ impl EventTranslatorState {
             } => self.translate_message_delta_usage(usage),
             RawAnthropicEvent::MessageStop => Vec::new(),
         }
+    }
+
+    /// 嵌套 Agent 偶尔只发送完整 assistant 快照而没有对应 stream_event。
+    /// 以 tool_use_id 去重补建调用，避免后续 tool_result 找不到上下文。
+    fn translate_assistant_envelope(&mut self, env: AssistantEnvelope) -> Vec<ServerNotification> {
+        let parent = env.parent_tool_use_id.as_deref();
+        let mut out = Vec::new();
+        let content = env
+            .message
+            .get("content")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        for block in content {
+            if block.get("type").and_then(Value::as_str) != Some("tool_use") {
+                continue;
+            }
+            let Some(id) = block.get("id").and_then(Value::as_str).map(str::to_string) else {
+                continue;
+            };
+            if self.open_tool_calls.contains_key(&id) || self.subagent_parents.contains_key(&id) {
+                continue;
+            }
+            let name = block
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_string();
+            let input = block.get("input").cloned().unwrap_or(Value::Null);
+            let kind = classify(&name);
+            let call = OpenToolCall {
+                item_id: id.clone(),
+                kind: kind.clone(),
+                tool_name: name.clone(),
+                input_buf: input.to_string(),
+                bash_cursor: 0,
+                bash_in_command_value: false,
+                bash_command_terminated: true,
+                parent_tool_use_id: parent.map(str::to_string),
+            };
+            self.subagent_parents.insert(id.clone(), id.clone());
+            let deferred = matches!(
+                kind,
+                CodexToolKind::PlanExit
+                    | CodexToolKind::RequestUserInput
+                    | CodexToolKind::TodoUpdate
+                    | CodexToolKind::ExplorationRead
+                    | CodexToolKind::ExplorationSearch
+                    | CodexToolKind::ExplorationList
+                    | CodexToolKind::WebSearch
+                    | CodexToolKind::Subagent
+            );
+            let item = if deferred {
+                build_deferred_started_item(&call, &self.thread_id)
+            } else {
+                Some(tool_started_item(&kind, &name, &id, &input))
+            };
+            self.open_tool_calls.insert(id, call);
+            if let Some(item) = item {
+                out.push(self.item_started(item, parent));
+            }
+        }
+        out
     }
 
     fn translate_block_start(
@@ -315,7 +354,8 @@ impl EventTranslatorState {
                 let kind = classify(&name);
                 let item_id = id.clone();
                 self.subagent_parents.insert(id.clone(), item_id.clone());
-                self.block_index_to_tool_id.insert(index, id.clone());
+                self.block_index_to_tool_id
+                    .insert((parent.map(str::to_string), index), id.clone());
                 // Some kinds need their full input JSON to compose a useful
                 // ItemStarted (Plan needs the plan text; Read/Grep/Glob need
                 // the file_path / pattern to build the command string and
@@ -414,7 +454,7 @@ impl EventTranslatorState {
         let parent_resolved = self.resolve_parent(parent);
         let thread_id = self.thread_id.clone();
         let turn_id = self.turn_id.clone();
-        let tool_id = self.tool_id_for_block_index(index);
+        let tool_id = self.tool_id_for_block_index(index, parent);
         let Some(tool_id) = tool_id else {
             return Vec::new();
         };
@@ -500,8 +540,10 @@ impl EventTranslatorState {
 
     /// Find the open tool call whose `content_block.index` matches `index`,
     /// via the side map populated at `content_block_start` time.
-    fn tool_id_for_block_index(&self, index: u32) -> Option<String> {
-        self.block_index_to_tool_id.get(&index).cloned()
+    fn tool_id_for_block_index(&self, index: u32, parent: Option<&str>) -> Option<String> {
+        self.block_index_to_tool_id
+            .get(&(parent.map(str::to_string), index))
+            .cloned()
     }
 
     fn translate_block_stop(
@@ -539,22 +581,13 @@ impl EventTranslatorState {
         // item/completed waits for the matching tool_result.
         let mut out = Vec::new();
         let parent_resolved = self.resolve_parent(parent);
-        let tool_id = self.tool_id_for_block_index(index);
+        let tool_id = self.tool_id_for_block_index(index, parent);
         if let Some(tool_id) = tool_id {
             if let Some(call) = self.open_tool_calls.get(&tool_id) {
                 if let Some(item) = build_deferred_started_item(call, &self.thread_id) {
                     out.push(
                         self.item_started(item, call.parent_tool_use_id.as_deref().or(parent)),
                     );
-                }
-                if matches!(call.kind, CodexToolKind::RequestUserInput) {
-                    let questions = parse_ask_user_questions(&call.input_buf);
-                    self.pending_user_input_requests
-                        .push(PendingUserInputRequest {
-                            item_id: call.item_id.clone(),
-                            tool_use_id: tool_id.clone(),
-                            questions,
-                        });
                 }
             }
             if let Some(call) = self.open_tool_calls.get_mut(&tool_id) {
@@ -1250,60 +1283,6 @@ fn parse_todo_status(status: &str) -> TurnPlanStepStatus {
         "completed" => TurnPlanStepStatus::Completed,
         _ => TurnPlanStepStatus::Pending,
     }
-}
-
-/// Parse `arguments.questions[]` from an AskUserQuestion tool's
-/// accumulated input buffer into the codex
-/// [`ToolRequestUserInputQuestion`] shape. Synthesizes a stable
-/// `question-{i}` id since claude doesn't give one. Returns an empty
-/// vec if the JSON isn't parseable or the field is missing.
-fn parse_ask_user_questions(input_buf: &str) -> Vec<ToolRequestUserInputQuestion> {
-    let parsed: Value = match serde_json::from_str(input_buf) {
-        Ok(v) => v,
-        Err(_) => return Vec::new(),
-    };
-    let Some(arr) = parsed.get("questions").and_then(Value::as_array) else {
-        return Vec::new();
-    };
-    arr.iter()
-        .enumerate()
-        .map(|(idx, q)| {
-            let header = q
-                .get("header")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
-            let question = q
-                .get("question")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
-            let options = q.get("options").and_then(Value::as_array).map(|opts| {
-                opts.iter()
-                    .map(|opt| ToolRequestUserInputOption {
-                        label: opt
-                            .get("label")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_string(),
-                        description: opt
-                            .get("description")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_string(),
-                    })
-                    .collect()
-            });
-            ToolRequestUserInputQuestion {
-                id: format!("question-{idx}"),
-                header,
-                question,
-                is_other: false,
-                is_secret: false,
-                options,
-            }
-        })
-        .collect()
 }
 
 /// Build a `Vec<FileUpdateChange>` from a claude file-mutating tool's
@@ -3115,7 +3094,7 @@ mod tests {
     }
 
     #[test]
-    fn ask_user_question_emits_no_notifications_and_stages_pending_request() {
+    fn ask_user_question_stream_events_emit_no_duplicate_request() {
         let mut s = state();
         let out = run_tool_lifecycle(
             &mut s,
@@ -3134,39 +3113,6 @@ mod tests {
             )),
             "AskUserQuestion must not emit any UI notifications; got {out:?}"
         );
-        let pending = s.take_pending_user_input_requests();
-        assert_eq!(pending.len(), 1);
-        let p = &pending[0];
-        assert_eq!(p.tool_use_id, "toolu_ask");
-        assert_eq!(p.item_id, "toolu_ask");
-        assert_eq!(p.questions.len(), 1);
-        assert_eq!(p.questions[0].id, "question-0");
-        assert_eq!(p.questions[0].header, "Pick");
-        assert_eq!(p.questions[0].question, "Which one?");
-        let opts = p.questions[0].options.as_ref().expect("options");
-        assert_eq!(opts.len(), 2);
-        assert_eq!(opts[0].label, "A");
-        assert_eq!(opts[1].label, "B");
-        // Drain again: no leftovers.
-        assert!(s.take_pending_user_input_requests().is_empty());
-    }
-
-    #[test]
-    fn ask_user_question_with_multiple_questions_synthesizes_stable_ids() {
-        let mut s = state();
-        let _ = run_tool_lifecycle(
-            &mut s,
-            "toolu_ask2",
-            "AskUserQuestion",
-            r#"{"questions":[{"header":"H1","question":"Q1","options":[{"label":"a","description":""}]},{"header":"H2","question":"Q2","options":[{"label":"b","description":""}]}]}"#,
-            "",
-            false,
-        );
-        let pending = s.take_pending_user_input_requests();
-        let p = &pending[0];
-        assert_eq!(p.questions.len(), 2);
-        assert_eq!(p.questions[0].id, "question-0");
-        assert_eq!(p.questions[1].id, "question-1");
     }
 
     #[test]

@@ -32,7 +32,7 @@ alleycat-acp-bridge = { path = "crates/acp-bridge", version = "0.1" }
 alleycat-bridge-core = { path = "crates/bridge-core", version = "0.1" }
 alleycat-amp-bridge = { path = "crates/amp-bridge", version = "0.1" }
 alleycat-codex-proto = { path = "crates/codex-proto", version = "0.1" }
-alleycat-claude-bridge = { path = "crates/claude-bridge", version = "0.1" }
+alleycat-claude-bridge = { path = "crates/claude-bridge", version = "0.2" }
 alleycat-claude-remote-control = { path = "crates/claude-remote-control", version = "0.1" }
 alleycat-devin-bridge = { path = "crates/devin-bridge", version = "0.1" }
 alleycat-grok-bridge = { path = "crates/grok-bridge", version = "0.1" }

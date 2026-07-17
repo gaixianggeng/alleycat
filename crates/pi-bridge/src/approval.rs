@@ -532,6 +532,7 @@ mod tests {
             is_other: false,
             is_secret: false,
             options: None,
+            multi_select: false,
         };
         let send_task = tokio::spawn(async move {
             request_user_input(

@@ -15,6 +15,10 @@ use alleycat_claude_bridge::ClaudeBridge;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    if version_requested() {
+        println!("alleycat-claude-bridge {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -55,6 +59,12 @@ async fn main() -> Result<()> {
     }
 }
 
+fn version_requested() -> bool {
+    std::env::args_os()
+        .skip(1)
+        .any(|arg| arg == "--version" || arg == "-V")
+}
+
 fn socket_arg() -> Option<PathBuf> {
     let mut args = std::env::args_os().skip(1);
     while let Some(arg) = args.next() {
@@ -63,4 +73,12 @@ fn socket_arg() -> Option<PathBuf> {
         }
     }
     std::env::var_os("ALLEYCAT_BRIDGE_SOCKET").map(PathBuf::from)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn package_is_the_compatibility_release() {
+        assert_eq!(env!("CARGO_PKG_VERSION"), "0.2.0");
+    }
 }

@@ -453,6 +453,9 @@ pub struct ToolRequestUserInputQuestion {
     pub is_secret: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub options: Option<Vec<ToolRequestUserInputOption>>,
+    /// Claude AskUserQuestion supports selecting more than one option.
+    #[serde(default)]
+    pub multi_select: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]

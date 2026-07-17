@@ -39,24 +39,14 @@ pub use process::{
 
 /// Pool-wide spawn policy. New fields go here so the per-thread
 /// `acquire_*` signatures stay flat.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct PoolPolicy {
     /// When true, every spawned claude gets `--dangerously-skip-permissions`
-    /// (matches the user's local `claude` shell alias; v1 default). When
-    /// false, claude is spawned with `--permission-prompt-tool stdio` and
+    /// `--dangerously-skip-permissions`. 0.2 起默认 false；此时 claude
+    /// 使用 `--permission-prompt-tool stdio`，并且
     /// the bridge bridges every `can_use_tool` control_request to a codex
     /// `requestApproval` request on the connected client.
     pub bypass_permissions: bool,
-}
-
-impl Default for PoolPolicy {
-    fn default() -> Self {
-        Self {
-            // Default true preserves v1 behavior. Operators flip via
-            // `agents.claude.bypass_permissions = false` in host.toml.
-            bypass_permissions: true,
-        }
-    }
 }
 
 /// Thread-safe pool of claude processes.

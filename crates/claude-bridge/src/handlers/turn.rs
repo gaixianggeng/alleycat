@@ -28,6 +28,7 @@ use std::sync::Mutex as SyncMutex;
 use std::time::{Duration, SystemTime};
 
 use thiserror::Error;
+use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
@@ -39,9 +40,7 @@ use crate::pool::ClaudeProcessHandle;
 use crate::pool::claude_protocol::{ClaudeEvent, ClaudeOutbound, ControlRequestBody};
 use crate::pool::process::ClaudeProcessError;
 use crate::state::ConnectionState;
-use crate::translate::events::{
-    EventTranslatorState, PendingUserInputRequest, turn_status_from_result,
-};
+use crate::translate::events::{EventTranslatorState, turn_status_from_result};
 use crate::translate::input::translate_user_input;
 
 /// Time the bridge gives claude to acknowledge a `control_request{interrupt}`.
@@ -70,6 +69,34 @@ fn effort_to_thinking_tokens(effort: p::ReasoningEffort) -> u32 {
         // direct equivalent so we cap at the High budget.
         p::ReasoningEffort::XHigh => 32_768,
         p::ReasoningEffort::Max => 32_768,
+    }
+}
+
+/// 将移动端三档权限映射为 Claude Code 的运行时权限模式。
+/// 沙箱只读优先级最高；只有明确的自动审批组合才启用 `auto`。
+fn claude_permission_mode(params: &p::TurnStartParams) -> &'static str {
+    if params.sandbox_policy.as_ref().is_some_and(is_read_only) {
+        return "plan";
+    }
+    if matches!(params.approval_policy, Some(p::AskForApproval::OnFailure))
+        && matches!(
+            params.approvals_reviewer,
+            Some(p::ApprovalsReviewer::AutoReview)
+        )
+    {
+        return "auto";
+    }
+    "default"
+}
+
+fn is_read_only(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::String(mode) => matches!(mode.as_str(), "read-only" | "readOnly"),
+        serde_json::Value::Object(map) => map
+            .get("type")
+            .or_else(|| map.get("mode"))
+            .is_some_and(is_read_only),
+        _ => false,
     }
 }
 
@@ -138,15 +165,19 @@ pub async fn handle_turn_start(
     let normalized_model_override = params.model.as_deref().map(normalize_claude_model_id);
     let model_override = normalized_model_override.as_deref();
     let thinking_override = params.effort.map(effort_to_thinking_tokens);
-    if model_override.is_some() || thinking_override.is_some() {
-        if let Err(err) = handle
-            .apply_runtime_overrides(model_override, thinking_override, None, CONTROL_SET_TIMEOUT)
-            .await
-        {
-            return Err(TurnError::ClaudeRpc(format!(
-                "applying runtime overrides: {err}"
-            )));
-        }
+    let permission_mode = claude_permission_mode(&params);
+    if let Err(err) = handle
+        .apply_runtime_overrides(
+            model_override,
+            thinking_override,
+            Some(permission_mode),
+            CONTROL_SET_TIMEOUT,
+        )
+        .await
+    {
+        return Err(TurnError::ClaudeRpc(format!(
+            "applying runtime overrides: {err}"
+        )));
     }
 
     let turn_id = Uuid::now_v7().to_string();
@@ -394,6 +425,10 @@ fn spawn_event_pump(args: EventPumpArgs) {
 async fn run_event_pump(mut args: EventPumpArgs) {
     let mut translator = EventTranslatorState::new(args.thread_id.clone(), args.turn_id.clone());
     let mut error_message: Option<String> = None;
+    // Claude 可并发发出多个 can_use_tool；移动端一次只展示一个交互，
+    // 用同一把公平锁保证审批和提问按到达顺序串行完成。
+    let interaction_gate = Arc::new(AsyncMutex::new(()));
+    let mut interaction_tasks = Vec::new();
 
     loop {
         let event = match args.events_rx.recv().await {
@@ -432,7 +467,9 @@ async fn run_event_pump(mut args: EventPumpArgs) {
                     let thread_id = args.thread_id.clone();
                     let turn_id = args.turn_id.clone();
                     let request_id = req.request_id.clone();
-                    tokio::spawn(async move {
+                    let interaction_gate = Arc::clone(&interaction_gate);
+                    interaction_tasks.push(tokio::spawn(async move {
+                        let _guard = interaction_gate.lock().await;
                         match approval::handle_can_use_tool(
                             &state, &handle, &thread_id, &turn_id, req,
                         )
@@ -451,7 +488,7 @@ async fn run_event_pump(mut args: EventPumpArgs) {
                                 );
                             }
                         }
-                    });
+                    }));
                 } else if let Some(request_id) =
                     value.get("request_id").and_then(serde_json::Value::as_str)
                 {
@@ -498,24 +535,15 @@ async fn run_event_pump(mut args: EventPumpArgs) {
             let _ = args.state.send(frame);
         }
 
-        // Drain AskUserQuestion calls staged by the translator and
-        // dispatch each as an `item/tool/requestUserInput` round-trip.
-        // The handler synthesizes the `tool_result` envelope that
-        // claude is awaiting on stdin, so the model can resume the turn
-        // with the user's answer.
-        for pending in translator.take_pending_user_input_requests() {
-            let state = Arc::clone(&args.state);
-            let handle = Arc::clone(&args.handle);
-            let thread_id = args.thread_id.clone();
-            let turn_id = args.turn_id.clone();
-            tokio::spawn(async move {
-                dispatch_pending_user_input(state, handle, thread_id, turn_id, pending).await;
-            });
-        }
-
         if is_terminal {
             break;
         }
+    }
+
+    // turn 结束或进程断开时取消所有等待中的移动端交互；
+    // approval::PendingRequestGuard 会同步回收 pending request 槽位。
+    for task in interaction_tasks {
+        task.abort();
     }
 
     // Emit turn/completed regardless of how we exited.
@@ -546,104 +574,6 @@ async fn run_event_pump(mut args: EventPumpArgs) {
 
     clear_active_turn(&args.thread_id);
     args.state.claude_pool().mark_idle(&args.thread_id).await;
-}
-
-/// Dispatch one staged AskUserQuestion: round-trip the question through
-/// the codex client and inject the synthesized answer back into claude's
-/// stdin so the model can resume the turn. Best-effort — on failure we
-/// log and inject an `is_error` tool_result so claude doesn't hang.
-async fn dispatch_pending_user_input(
-    state: Arc<ConnectionState>,
-    handle: Arc<ClaudeProcessHandle>,
-    thread_id: String,
-    turn_id: String,
-    pending: PendingUserInputRequest,
-) {
-    let result = approval::request_user_input(
-        &state,
-        thread_id,
-        turn_id,
-        pending.item_id.clone(),
-        pending.questions.clone(),
-        None,
-    )
-    .await;
-    let envelope = match result {
-        Ok(answers) => synthesize_user_input_tool_result(&pending.tool_use_id, &answers, false),
-        Err(err) => {
-            tracing::warn!(
-                ?err,
-                "AskUserQuestion bridging failed; sending error tool_result"
-            );
-            let err_payload = serde_json::json!({
-                "error": format!("bridge could not collect user answers: {err}"),
-            });
-            user_envelope_with_tool_result(&pending.tool_use_id, err_payload.to_string(), true)
-        }
-    };
-    if let Err(e) = handle.send_serialized(&envelope) {
-        tracing::warn!(
-            ?e,
-            "failed to inject synthetic user envelope into claude stdin"
-        );
-    }
-}
-
-/// Build the `{"type":"user", ...}` envelope claude expects on stdin to
-/// resume a turn after a tool_use, carrying our synthesized
-/// `tool_result`. The `content` field is a string body — claude's
-/// stream-json reader treats it as opaque text and surfaces it back to
-/// the model. The exact shape of the answers payload is the
-/// load-bearing unknown flagged in the section-B plan; if claude
-/// rejects this format on a live trace, only the answer-encoding
-/// helper [`synthesize_user_input_tool_result`] needs to change.
-fn user_envelope_with_tool_result(
-    tool_use_id: &str,
-    content: String,
-    is_error: bool,
-) -> serde_json::Value {
-    serde_json::json!({
-        "type": "user",
-        "message": {
-            "role": "user",
-            "content": [{
-                "type": "tool_result",
-                "tool_use_id": tool_use_id,
-                "content": content,
-                "is_error": is_error,
-            }]
-        }
-    })
-}
-
-/// Construct the answers payload claude's AskUserQuestion tool expects.
-/// **Best-effort shape**, pending live-trace verification (per the
-/// section-B plan note). The codex `ToolRequestUserInputAnswer` carries
-/// `answers: Vec<String>`; we collapse multi-select to a JSON array and
-/// single-select to a single string under each synthesized
-/// `question-{i}` key.
-fn synthesize_user_input_tool_result(
-    tool_use_id: &str,
-    answers: &std::collections::HashMap<String, p::ToolRequestUserInputAnswer>,
-    is_error: bool,
-) -> serde_json::Value {
-    let mut answers_obj = serde_json::Map::new();
-    for (qid, ans) in answers {
-        let value = match ans.answers.len() {
-            0 => serde_json::Value::Null,
-            1 => serde_json::Value::String(ans.answers[0].clone()),
-            _ => serde_json::Value::Array(
-                ans.answers
-                    .iter()
-                    .cloned()
-                    .map(serde_json::Value::String)
-                    .collect(),
-            ),
-        };
-        answers_obj.insert(qid.clone(), value);
-    }
-    let body = serde_json::json!({ "answers": answers_obj }).to_string();
-    user_envelope_with_tool_result(tool_use_id, body, is_error)
 }
 
 /// Map a `ServerNotification` to its `method` string and consult the
@@ -732,6 +662,23 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(err, TurnError::ThreadNotLoaded(_)));
+    }
+
+    #[test]
+    fn permission_modes_follow_the_three_safe_presets() {
+        let mut params = p::TurnStartParams::default();
+        assert_eq!(claude_permission_mode(&params), "default");
+
+        params.sandbox_policy = Some(serde_json::json!({"type": "readOnly"}));
+        assert_eq!(claude_permission_mode(&params), "plan");
+
+        params.sandbox_policy = Some(serde_json::json!({"type": "workspaceWrite"}));
+        params.approval_policy = Some(p::AskForApproval::OnFailure);
+        params.approvals_reviewer = Some(p::ApprovalsReviewer::AutoReview);
+        assert_eq!(claude_permission_mode(&params), "auto");
+
+        params.approval_policy = Some(p::AskForApproval::Never);
+        assert_eq!(claude_permission_mode(&params), "default");
     }
 
     #[tokio::test]

@@ -675,6 +675,7 @@ async fn handle_extension_ui_request(args: &EventPumpArgs, req: &pi::ExtensionUi
                         })
                         .collect(),
                 ),
+                multi_select: false,
             },
         ),
         R::Confirm {
@@ -697,6 +698,7 @@ async fn handle_extension_ui_request(args: &EventPumpArgs, req: &pi::ExtensionUi
                         description: String::new(),
                     },
                 ]),
+                multi_select: false,
             },
         ),
         R::Input {
@@ -713,6 +715,7 @@ async fn handle_extension_ui_request(args: &EventPumpArgs, req: &pi::ExtensionUi
                 is_other: placeholder.is_some(),
                 is_secret: false,
                 options: None,
+                multi_select: false,
             },
         ),
         R::Editor { id, title, .. } => (
@@ -724,6 +727,7 @@ async fn handle_extension_ui_request(args: &EventPumpArgs, req: &pi::ExtensionUi
                 is_other: true,
                 is_secret: false,
                 options: None,
+                multi_select: false,
             },
         ),
         R::Notify { .. }

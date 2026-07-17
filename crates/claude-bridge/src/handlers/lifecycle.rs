@@ -78,23 +78,44 @@ pub fn handle_account_rate_limits_read(
 ) -> p::GetAccountRateLimitsResponse {
     let info = state.caches().rate_limit_info;
     let Some(info) = info else {
-        return p::GetAccountRateLimitsResponse::default();
+        return p::GetAccountRateLimitsResponse {
+            rate_limits: p::RateLimitSnapshot {
+                limit_id: Some("claude".into()),
+                limit_name: Some("Claude".into()),
+                availability: Some("unavailable".into()),
+                unavailable_reason: Some("headless_statusline_unavailable".into()),
+                ..Default::default()
+            },
+            rate_limits_by_limit_id: None,
+        };
     };
 
-    let window = p::RateLimitWindow {
-        used_percent: 0,
-        window_duration_mins: None,
+    let duration = match info.rate_limit_type.as_deref() {
+        Some("five_hour") => Some(300),
+        Some("seven_day") => Some(10_080),
+        _ => None,
+    };
+    let window = duration.map(|duration| p::RateLimitWindow {
+        used_percent: None,
+        window_duration_mins: Some(duration),
         resets_at: info.resets_at,
+    });
+    let (primary, secondary) = match info.rate_limit_type.as_deref() {
+        Some("five_hour") => (window, None),
+        Some("seven_day") => (None, window),
+        _ => (None, None),
     };
     let snapshot = p::RateLimitSnapshot {
-        limit_id: info.rate_limit_type.clone(),
-        limit_name: info.rate_limit_type.clone(),
-        primary: Some(window),
-        secondary: None,
+        limit_id: Some("claude".into()),
+        limit_name: Some("Claude".into()),
+        primary,
+        secondary,
         credits: None,
         plan_type: None,
         rate_limit_reached_type: (info.status != "allowed")
             .then(|| serde_json::Value::String(info.status.clone())),
+        availability: Some("partial".into()),
+        unavailable_reason: Some("usage_percentage_unavailable".into()),
     };
     p::GetAccountRateLimitsResponse {
         rate_limits: snapshot,

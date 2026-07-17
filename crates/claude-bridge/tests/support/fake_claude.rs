@@ -118,6 +118,24 @@ fn main() -> ExitCode {
             }
         };
 
+        if inbound.get("type").and_then(Value::as_str) == Some("control_request") {
+            let request_id = inbound
+                .get("request_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            emit(
+                &mut out,
+                &json!({
+                    "type": "control_response",
+                    "response": {
+                        "request_id": request_id,
+                        "subtype": "success"
+                    }
+                }),
+            );
+            continue;
+        }
+
         if let Ok(log_path) = env::var("FAKE_CLAUDE_TURN_LOG") {
             if !log_path.is_empty() {
                 let user_text = first_user_text(&inbound).unwrap_or_else(|| "<no-text>".into());

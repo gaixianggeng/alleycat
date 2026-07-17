@@ -251,6 +251,21 @@ impl ClaudeProcessHandle {
         args.push("stream-json".into());
         args.push("--include-partial-messages".into());
         args.push("--verbose".into());
+        // 通过临时 JSON 覆盖启用 Claude 官方 Bash 沙箱；不改写项目或用户 settings。
+        // 沙箱不可用时直接失败，绝不回退到未隔离命令。
+        args.push("--settings".into());
+        args.push(
+            serde_json::json!({
+                "sandbox": {
+                    "enabled": true,
+                    "failIfUnavailable": true,
+                    "allowUnsandboxedCommands": false,
+                    "autoAllowBashIfSandboxed": false
+                }
+            })
+            .to_string()
+            .into(),
+        );
         if bypass_permissions {
             args.push("--dangerously-skip-permissions".into());
         } else {

@@ -127,12 +127,19 @@ pub struct RateLimitSnapshot {
     pub plan_type: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_limit_reached_type: Option<Value>,
+    /// Provider-specific availability marker used when an official headless
+    /// API cannot expose usage percentages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub availability: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable_reason: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct RateLimitWindow {
-    pub used_percent: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub used_percent: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window_duration_mins: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
