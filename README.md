@@ -1,5 +1,17 @@
 # Alleycat
 
+> [!IMPORTANT]
+> This fork is archived. Mimi Remote now maintains the Claude Code bridge in its
+> single source repository: [gaixianggeng/codex-ipad-agent](https://github.com/gaixianggeng/codex-ipad-agent/tree/main/bridges/claude).
+> Install the maintained bridge with:
+>
+> ```bash
+> cargo install --git https://github.com/gaixianggeng/codex-ipad-agent.git \
+>   --locked --force --bin alleycat-claude-bridge alleycat-claude-bridge
+> ```
+>
+> The source below is retained as an archived upstream fork for provenance only.
+
 ![Alleycat logo](assets/alleycat-logo.png)
 
 Iroh-backed bridge that multiplexes a few local coding agents — Codex, Pi, Amp, OpenCode, Claude, Factory Droid, and Hermes — onto a single QUIC connection. Run the daemon on your machine, scan a QR with a paired client, and the client picks an agent over the same stream multiplexer.
